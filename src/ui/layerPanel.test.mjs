@@ -13,7 +13,9 @@ test('panel presentation places Transit between Street Traffic and Bike Share in
     source.indexOf('const PANEL_POSITIONS ='),
   );
   const order = JSON.parse(
-    runInNewContext(`${declarations}\nJSON.stringify(PANEL_ORDER)`),
+    runInNewContext(
+      `const msg = (text) => text;\n${declarations}\nJSON.stringify(PANEL_ORDER)`,
+    ),
   );
   assert.deepEqual(
     order.filter(({ label }) => label === 'Movement').map(({ id }) => id),
@@ -89,6 +91,27 @@ test('partial feed controls distinguish incomplete records from stale data and o
   layer.enabled = false;
   panel._syncToggleButton(button, layer);
   assert.equal(button.textContent, 'OFF');
+});
+
+test('a stale row dates cached data by its oldest tile, not the last load', async () => {
+  const { LayerPanel } = await import('./layerPanel.js');
+  const panel = LayerPanel.prototype;
+  const layer = {
+    id: 'traffic',
+    name: 'Street Traffic',
+    source: 'TomTom',
+    enabled: true,
+    stats: {
+      mode: 'live',
+      stale: true,
+      count: 4,
+      lastUpdate: Date.now(),
+      oldestTileAt: Date.now() - 3 * 3600_000,
+    },
+  };
+  assert.match(panel._buildMetaText(layer), /^STALE · TomTom · 3h ago$/);
+  delete layer.stats.oldestTileAt;
+  assert.match(panel._buildMetaText(layer), /^STALE · TomTom · just now$/);
 });
 
 test('readout rows contain only toggles and metadata; ordinary rows retain controls', async () => {
@@ -227,4 +250,131 @@ test('the Recent Imagery readout mounts in its rail body like the weather readou
     panel.destroy();
     globalThis.document = previousDocument;
   }
+});
+
+test('an omitted source is visibly unavailable and cannot be toggled on', async () => {
+  const { LayerPanel } = await import('./layerPanel.js');
+  const attrs = new Map();
+  const button = {
+    classList: { toggle() {} },
+    dataset: {},
+    setAttribute: (key, value) => attrs.set(key, value),
+  };
+  const layer = {
+    id: 'flights',
+    name: 'Flights',
+    enabled: false,
+    stats: {
+      sourceUnavailable: true,
+      status: 'unavailable',
+      error: 'Data source not configured: flights',
+    },
+  };
+  LayerPanel.prototype._syncToggleButton(button, layer);
+  assert.equal(button.textContent, 'UNAVAILABLE');
+  assert.equal(attrs.get('aria-disabled'), 'true');
+  assert.match(button.title, /not configured/);
+  LayerPanel.prototype._syncToggleButton(button, { ...layer, enabled: true });
+  assert.equal(
+    attrs.get('aria-disabled'),
+    'false',
+    'an active layer can always be switched off',
+  );
+});
+
+test('row text keeps a hyphenated code whole and never starts a line with the separator', async () => {
+  const { setRowText } = await import('./layerPanel.js');
+  const previousDocument = globalThis.document;
+  const element = () => ({
+    className: '',
+    textContent: '',
+    children: [],
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+  });
+  globalThis.document = { createElement: element };
+  try {
+    const text = (node) =>
+      node.children.length
+        ? node.children.map((child) => child.textContent).join('')
+        : node.textContent;
+    const kept = (node) =>
+      node.children
+        .filter((child) => child.className === 'data-keep')
+        .map((child) => child.textContent);
+
+    const name = element();
+    setRowText(name, 'Локальный ADS-B');
+    assert.equal(text(name), 'Локальный ADS-B');
+    assert.deepEqual(kept(name), ['ADS-B']);
+
+    const meta = element();
+    setRowText(meta, 'UNAVAILABLE · NASA FIRMS · LIVE · KEY REQUIRED');
+    assert.equal(text(meta), 'UNAVAILABLE · NASA FIRMS · LIVE · KEY REQUIRED');
+    assert.deepEqual(kept(meta), [' ·', ' ·', ' ·']);
+    assert.ok(
+      meta.children.every((child) => !child.textContent.startsWith('·')),
+      'the space before each dot is held to the piece it closes',
+    );
+
+    const plain = element();
+    setRowText(plain, 'Satellites');
+    assert.equal(plain.textContent, 'Satellites');
+    assert.equal(plain.children.length, 0);
+
+    const long = element();
+    setRowText(long, 'see https-proxy-endpoint-config-x');
+    assert.deepEqual(kept(long), [], 'a long hyphenated run may still wrap');
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test('the unavailable chip may abbreviate, but its accessible name keeps the full state', async () => {
+  const { LayerPanel } = await import('./layerPanel.js');
+  const attrs = new Map();
+  const button = {
+    classList: { toggle() {} },
+    dataset: {},
+    setAttribute: (key, value) => attrs.set(key, value),
+  };
+  LayerPanel.prototype._syncToggleButton(button, {
+    id: 'local-firms',
+    name: 'FIRMS Active Fires',
+    enabled: false,
+    stats: { sourceUnavailable: true, error: 'KEY REQUIRED' },
+  });
+  assert.equal(button.textContent, 'UNAVAILABLE');
+  assert.equal(button.dataset.feedState, 'unavailable');
+  assert.match(attrs.get('aria-label'), /^Active Fires: UNAVAILABLE\./);
+});
+
+test('the Weather readout receives enabled air-quality alongside weather layers', async () => {
+  const { LayerPanel } = await import('./layerPanel.js');
+  const layers = ['wind', 'air-quality', 'other'].map((id) => ({
+    id,
+    icon: '*',
+    enabled: true,
+  }));
+  layers.push({ id: 'weather-radar', icon: '*', enabled: false });
+  const panel = new LayerPanel({
+    getLayers: () => layers,
+    getRowControls: (id) => ({ readout: true, summary: { label: id } }),
+  });
+  let entries = null;
+  panel._weatherPanel = {
+    update: (next) => {
+      entries = next;
+    },
+  };
+  panel._refreshWeatherPanel();
+  assert.deepEqual(
+    entries.map(({ id, summary }) => [id, summary.label]),
+    [
+      ['wind', 'wind'],
+      ['air-quality', 'air-quality'],
+    ],
+  );
 });
